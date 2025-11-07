@@ -257,6 +257,7 @@ class TestJsonToCsvStdlib:
         assert len(rows) == 3
 
         headers = reader.fieldnames
+        assert headers is not None
         assert "ticker" in headers
         assert "price" in headers
         assert "volume" in headers

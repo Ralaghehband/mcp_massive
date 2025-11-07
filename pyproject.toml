@@ -3,10 +3,11 @@ name = "mcp_massive"
 version = "0.6.0"
 description = "A MCP server project"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 dependencies = [
     "mcp[cli]>=1.15.0",
  "polygon-api-client>=1.15.4",
+    "psutil>=5.9.0",
 ]
 [[project.authors]]
 name = "Massive"
@@ -25,3 +26,6 @@ dev = [
 
 [project.scripts]
 mcp_massive = "mcp_massive:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

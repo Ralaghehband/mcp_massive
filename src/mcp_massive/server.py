@@ -1,16 +1,32 @@
+import json
 import os
-from typing import Optional, Any, Dict, Union, List, Literal
-from mcp.server.fastmcp import FastMCP
-from mcp.types import ToolAnnotations
+from typing import Optional, Any, Dict, Union, List, Literal, cast, TYPE_CHECKING
+
+try:
+    from mcp.server.fastmcp import FastMCP
+    from mcp.types import ToolAnnotations
+except ImportError as exc:  # pragma: no cover
+    if TYPE_CHECKING:
+        from mcp.server.fastmcp import FastMCP  # type: ignore # pragma: no cover
+        from mcp.types import ToolAnnotations  # type: ignore # pragma: no cover
+    else:
+        raise RuntimeError(
+            "The 'mcp' package is required to run the Massive MCP server. "
+            "Install it with `pip install \"mcp[cli]\"`."
+        ) from exc
+
 from polygon import RESTClient
 from importlib.metadata import version, PackageNotFoundError
+import httpx
 from .formatters import json_to_csv
+from .options_utils import (
+    parse_occ_strike,
+    build_occ_option_list,
+    generate_strike_ladder,
+)
+from .massive_client import massive_get
 
 from datetime import datetime, date
-
-MASSIVE_API_KEY = os.environ.get("MASSIVE_API_KEY", "")
-if not MASSIVE_API_KEY:
-    print("Warning: MASSIVE_API_KEY environment variable not set.")
 
 version_number = "MCP-Massive/unknown"
 try:
@@ -18,13 +34,199 @@ try:
 except PackageNotFoundError:
     pass
 
-polygon_client = RESTClient(MASSIVE_API_KEY)
-polygon_client.headers["User-Agent"] += f" {version_number}"
+_API_KEY_WARNING_EMITTED = False
+_polygon_client: Any | None = None
+_polygon_http_client = httpx.Client(base_url="https://api.polygon.io", timeout=30)
+
+
+def _resolve_api_key() -> str:
+    """Return the configured API key, falling back to POLYGON_API_KEY if set."""
+    global _API_KEY_WARNING_EMITTED
+
+    massive_api_key = os.environ.get("MASSIVE_API_KEY", "")
+    if massive_api_key:
+        return massive_api_key
+
+    polygon_api_key = os.environ.get("POLYGON_API_KEY", "")
+    if polygon_api_key:
+        if not _API_KEY_WARNING_EMITTED:
+            print("Warning: POLYGON_API_KEY is deprecated. Please migrate to MASSIVE_API_KEY.")
+            _API_KEY_WARNING_EMITTED = True
+        os.environ["MASSIVE_API_KEY"] = polygon_api_key
+        return polygon_api_key
+
+    if not _API_KEY_WARNING_EMITTED:
+        print("Warning: MASSIVE_API_KEY environment variable not set.")
+        _API_KEY_WARNING_EMITTED = True
+    return ""
+
+
+def ensure_api_key() -> str:
+    """Ensure an API key is available and return it."""
+    api_key = _resolve_api_key()
+    if not api_key:
+        raise RuntimeError("MASSIVE_API_KEY environment variable is not set.")
+    return api_key
+
+
+def _get_polygon_client() -> Any:
+    """Create (or return) the shared REST client lazily."""
+    global _polygon_client
+    if _polygon_client is None:
+        api_key = ensure_api_key()
+        client: Any = RESTClient(api_key)
+        client.headers["User-Agent"] += f" {version_number}"
+        client._base_url = "https://api.polygon.io"
+        _polygon_client = client
+    return _polygon_client
+
+
+class _PolygonClientProxy:
+    """Proxy that lazily resolves the underlying Polygon client."""
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(_get_polygon_client(), name)
+
+
+# Pylance's typing stubs for RESTClient don't expose runtime-only attributes
+# such as `_session` or `.data` on raw results. Annotating as `Any` keeps the
+# code completion experience while preventing false-positive diagnostics.
+polygon_client: Any = _PolygonClientProxy()
+
+
+def polygon_get(path: str, params: Optional[Dict[str, Any]] = None) -> httpx.Response:
+    query = dict(params) if params else {}
+    query.setdefault("apiKey", ensure_api_key())
+    resp = _polygon_http_client.get(path, params=query, headers=getattr(_get_polygon_client(), "headers", {}))
+    resp.raise_for_status()
+    return resp
+
+
+def _ensure_occ_strikes(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure strike_price matches OCC ticker encoding."""
+    results = payload.get("results")
+    if not isinstance(results, list):
+        return payload
+    for entry in results:
+        details = entry.get("details")
+        if not isinstance(details, dict):
+            continue
+        ticker = details.get("ticker")
+        if not isinstance(ticker, str):
+            continue
+        try:
+            parsed = parse_occ_strike(ticker)
+        except ValueError:
+            continue
+        strike = details.get("strike_price")
+        if strike is None or abs(float(strike) - parsed) > 1e-6:
+            details["strike_price"] = parsed
+    return payload
+
+
+def _option_chain_fallback_csv(
+    underlying: str,
+    expiration_date: Optional[str],
+    contract_type: Optional[str],
+    strike: Optional[float],
+    strike_gte: Optional[float],
+    strike_lte: Optional[float],
+    order: Optional[str],
+    sort: Optional[str],
+    limit: Optional[int],
+) -> Optional[str]:
+    """Fallback by building ticker_any_of list when REST call fails."""
+    if not expiration_date:
+        return None
+
+    strikes = generate_strike_ladder(strike, strike_gte, strike_lte)
+    if not strikes:
+        return None
+
+    ct = contract_type.lower() if contract_type else None
+    ct_list = [ct] if ct in {"call", "put"} else ["call", "put"]
+
+    tickers: List[str] = []
+    for ct_item in ct_list:
+        tickers.extend(build_occ_option_list(underlying, expiration_date, ct_item, strikes))
+
+    try:
+        results = polygon_client.list_universal_snapshots(
+            type="options",
+            ticker_any_of=tickers,
+            order=order,
+            limit=limit,
+            sort=sort,
+            raw=True,
+        )
+        return _raw_to_csv(results)
+    except Exception:
+        return None
+
+def _raw_to_csv(raw_response: Any) -> str:
+    """Convert a polygon raw response (has .data bytes) to CSV via json_to_csv.
+
+    Uses a cast to Any so static type checkers don't complain about .data.
+    """
+    return json_to_csv(cast(Any, raw_response).data.decode("utf-8"))
+
+def _response_text_to_csv(resp: Any) -> str:
+    """Convert an httpx-like Response object with .text to CSV.
+
+    Some endpoints use polygon_client._session.get(...) and return an
+    httpx.Response which exposes .text instead of .data.
+    """
+    return json_to_csv(cast(Any, resp).text)
 
 poly_mcp = FastMCP("Massive")
 
 
 @poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def get_ticker_news(ticker: str, limit: int = 10) -> str:
+    """
+    Get recent news articles about a ticker.
+    """
+    try:
+        response = polygon_client.list_ticker_news(ticker=ticker, limit=limit, raw=True)
+        return _raw_to_csv(response)
+    except Exception as e:
+        print(f"Error in get_ticker_news: {e}")
+        return f"Error: {e}"
+
+
+@poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def get_options_snapshot(
+    underlying_ticker: str,
+    option_contract: Optional[str] = None
+) -> str:
+    """
+    Get snapshot data for options. If option_contract is provided, returns data for that specific contract.
+    If not provided, returns data for all available options.
+    For specific contracts, use format like: RZLV251107C00004500
+    """
+    try:
+        if option_contract:
+            # Single contract snapshot
+            full_contract = f"O:{option_contract}"
+            response = polygon_get(
+                f"/v3/snapshot/options/{underlying_ticker}/{full_contract}",
+                params=None,
+            )
+            print(f"Options snapshot response: {response.text}")
+            return json_to_csv(response.text)
+        else:
+            # Get list of available contracts
+            response = polygon_get(
+                "/v3/reference/options/contracts",
+                params={"underlying_ticker": underlying_ticker},
+            )
+            print(f"Options contracts response: {response.text}")
+            return json_to_csv(response.text)
+    except Exception as e:
+        print(f"Error in get_options_snapshot: {e}")
+        return f"Error: {e}"
+
+
 async def get_aggs(
     ticker: str,
     multiplier: int,
@@ -35,11 +237,17 @@ async def get_aggs(
     sort: Optional[str] = None,
     limit: Optional[int] = 10,
     params: Optional[Dict[str, Any]] = None,
+    is_options: bool = False
 ) -> str:
     """
     List aggregate bars for a ticker over a given date range in custom time window sizes.
+    Set is_options=True when querying options contracts.
     """
     try:
+        # Add O: prefix if this is an options contract
+        if is_options:
+            ticker = f"O:{ticker}"
+            
         results = polygon_client.get_aggs(
             ticker=ticker,
             multiplier=multiplier,
@@ -54,8 +262,9 @@ async def get_aggs(
         )
 
         # Parse the binary data to string and then to JSON
-        return json_to_csv(results.data.decode("utf-8"))
+        return _raw_to_csv(results)
     except Exception as e:
+        print(f"Error in get_aggs: {e}")
         return f"Error: {e}"
 
 
@@ -70,11 +279,17 @@ async def list_aggs(
     sort: Optional[str] = None,
     limit: Optional[int] = 10,
     params: Optional[Dict[str, Any]] = None,
+    is_options: bool = False
 ) -> str:
     """
     Iterate through aggregate bars for a ticker over a given date range.
+    Set is_options=True when querying options contracts.
     """
     try:
+        # Add O: prefix if this is an options contract
+        if is_options:
+            ticker = f"O:{ticker}"
+            
         results = polygon_client.list_aggs(
             ticker=ticker,
             multiplier=multiplier,
@@ -88,8 +303,9 @@ async def list_aggs(
             raw=True,
         )
 
-        return json_to_csv(results.data.decode("utf-8"))
+        return _raw_to_csv(results)
     except Exception as e:
+        print(f"Error in list_aggs: {e}")
         return f"Error: {e}"
 
 
@@ -116,7 +332,7 @@ async def get_grouped_daily_aggs(
             raw=True,
         )
 
-        return json_to_csv(results.data.decode("utf-8"))
+        return _raw_to_csv(results)
     except Exception as e:
         return f"Error: {e}"
 
@@ -136,7 +352,7 @@ async def get_daily_open_close_agg(
             ticker=ticker, date=date, adjusted=adjusted, params=params, raw=True
         )
 
-        return json_to_csv(results.data.decode("utf-8"))
+        return _raw_to_csv(results)
     except Exception as e:
         return f"Error: {e}"
 
@@ -155,7 +371,7 @@ async def get_previous_close_agg(
             ticker=ticker, adjusted=adjusted, params=params, raw=True
         )
 
-        return json_to_csv(results.data.decode("utf-8"))
+        return _raw_to_csv(results)
     except Exception as e:
         return f"Error: {e}"
 
@@ -191,7 +407,7 @@ async def list_trades(
             raw=True,
         )
 
-        return json_to_csv(results.data.decode("utf-8"))
+        return _raw_to_csv(results)
     except Exception as e:
         return f"Error: {e}"
 
@@ -207,7 +423,7 @@ async def get_last_trade(
     try:
         results = polygon_client.get_last_trade(ticker=ticker, params=params, raw=True)
 
-        return json_to_csv(results.data.decode("utf-8"))
+        return _raw_to_csv(results)
     except Exception as e:
         return f"Error: {e}"
 
@@ -226,7 +442,7 @@ async def get_last_crypto_trade(
             from_=from_, to=to, params=params, raw=True
         )
 
-        return json_to_csv(results.data.decode("utf-8"))
+        return _raw_to_csv(results)
     except Exception as e:
         return f"Error: {e}"
 
@@ -262,7 +478,7 @@ async def list_quotes(
             raw=True,
         )
 
-        return json_to_csv(results.data.decode("utf-8"))
+        return _raw_to_csv(results)
     except Exception as e:
         return f"Error: {e}"
 
@@ -278,7 +494,7 @@ async def get_last_quote(
     try:
         results = polygon_client.get_last_quote(ticker=ticker, params=params, raw=True)
 
-        return json_to_csv(results.data.decode("utf-8"))
+        return _raw_to_csv(results)
     except Exception as e:
         return f"Error: {e}"
 
@@ -297,7 +513,7 @@ async def get_last_forex_quote(
             from_=from_, to=to, params=params, raw=True
         )
 
-        return json_to_csv(results.data.decode("utf-8"))
+        return _raw_to_csv(results)
     except Exception as e:
         return f"Error: {e}"
 
@@ -323,7 +539,7 @@ async def get_real_time_currency_conversion(
             raw=True,
         )
 
-        return json_to_csv(results.data.decode("utf-8"))
+        return _raw_to_csv(results)
     except Exception as e:
         return f"Error: {e}"
 
@@ -341,6 +557,54 @@ async def list_universal_snapshots(
     Get universal snapshots for multiple assets of a specific type.
     """
     try:
+        if (
+            type.lower() == "options"
+            and params
+            and "underlying_ticker" in params
+            and not ticker_any_of
+        ):
+            query = dict(params)
+            underlying = query.pop("underlying_ticker")
+            query["order"] = order or query.get("order")
+            query["limit"] = limit or query.get("limit")
+            query["sort"] = sort or query.get("sort")
+            try:
+                response = massive_get(
+                    f"/v3/snapshot/options/{underlying}",
+                    {k: v for k, v in query.items() if v is not None},
+                )
+                payload = _ensure_occ_strikes(response.json())
+                if not payload.get("results"):
+                    fallback_csv = _option_chain_fallback_csv(
+                        underlying,
+                        query.get("expiration_date"),
+                        query.get("contract_type"),
+                        query.get("strike_price"),
+                        query.get("strike_price_gte") or query.get("strike_price_gt"),
+                        query.get("strike_price_lte") or query.get("strike_price_lt"),
+                        query.get("order"),
+                        query.get("sort"),
+                        query.get("limit"),
+                    )
+                    if fallback_csv:
+                        return fallback_csv
+                return json_to_csv(payload)
+            except httpx.HTTPStatusError:
+                fallback_csv = _option_chain_fallback_csv(
+                    underlying,
+                    query.get("expiration_date"),
+                    query.get("contract_type"),
+                    query.get("strike_price"),
+                    query.get("strike_price_gte") or query.get("strike_price_gt"),
+                    query.get("strike_price_lte") or query.get("strike_price_lt"),
+                    query.get("order"),
+                    query.get("sort"),
+                    query.get("limit"),
+                )
+                if fallback_csv:
+                    return fallback_csv
+                raise
+
         results = polygon_client.list_universal_snapshots(
             type=type,
             ticker_any_of=ticker_any_of,
@@ -351,7 +615,7 @@ async def list_universal_snapshots(
             raw=True,
         )
 
-        return json_to_csv(results.data.decode("utf-8"))
+        return _raw_to_csv(results)
     except Exception as e:
         return f"Error: {e}"
 
@@ -375,7 +639,7 @@ async def get_snapshot_all(
             raw=True,
         )
 
-        return json_to_csv(results.data.decode("utf-8"))
+        return _raw_to_csv(results)
     except Exception as e:
         return f"Error: {e}"
 
@@ -399,7 +663,7 @@ async def get_snapshot_direction(
             raw=True,
         )
 
-        return json_to_csv(results.data.decode("utf-8"))
+        return _raw_to_csv(results)
     except Exception as e:
         return f"Error: {e}"
 
@@ -414,11 +678,19 @@ async def get_snapshot_ticker(
     Get snapshot for a specific ticker.
     """
     try:
+        if market_type.lower() == "stocks":
+            query = dict(params) if params else {}
+            response = massive_get(
+                f"/v3/snapshot/stocks/{ticker}",
+                {k: v for k, v in query.items() if v is not None},
+            )
+            return json_to_csv(response.json())
+
         results = polygon_client.get_snapshot_ticker(
             market_type=market_type, ticker=ticker, params=params, raw=True
         )
 
-        return json_to_csv(results.data.decode("utf-8"))
+        return _raw_to_csv(results)
     except Exception as e:
         return f"Error: {e}"
 
@@ -440,7 +712,87 @@ async def get_snapshot_option(
             raw=True,
         )
 
-        return json_to_csv(results.data.decode("utf-8"))
+        return _raw_to_csv(results)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@poly_mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def get_option_chain_snapshot(
+    underlying_asset: str,
+    expiration_date: Optional[str] = None,
+    expiration_date_gte: Optional[str] = None,
+    expiration_date_lte: Optional[str] = None,
+    expiration_date_gt: Optional[str] = None,
+    expiration_date_lt: Optional[str] = None,
+    strike_price: Optional[float] = None,
+    strike_price_gte: Optional[float] = None,
+    strike_price_gt: Optional[float] = None,
+    strike_price_lte: Optional[float] = None,
+    strike_price_lt: Optional[float] = None,
+    contract_type: Optional[str] = None,
+    order: Optional[str] = None,
+    sort: Optional[str] = None,
+    limit: Optional[int] = 100,
+    params: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    Fetch Massive.com's option chain snapshot for an underlying asset.
+    """
+    try:
+        query: Dict[str, Any] = {
+            "underlying_asset": underlying_asset,
+            "expiration_date": expiration_date,
+            "expiration_date_gte": expiration_date_gte,
+            "expiration_date_lte": expiration_date_lte,
+            "expiration_date_gt": expiration_date_gt,
+            "expiration_date_lt": expiration_date_lt,
+            "strike_price": strike_price,
+            "strike_price_gte": strike_price_gte,
+            "strike_price_gt": strike_price_gt,
+            "strike_price_lte": strike_price_lte,
+            "strike_price_lt": strike_price_lt,
+            "contract_type": contract_type,
+            "order": order,
+            "sort": sort,
+            "limit": limit,
+        }
+        query = {k: v for k, v in query.items() if v is not None}
+        if params:
+            query.update(params)
+
+        response = massive_get(f"/v3/snapshot/options/{underlying_asset}", query)
+        payload = _ensure_occ_strikes(response.json())
+        if not payload.get("results"):
+            fallback_csv = _option_chain_fallback_csv(
+                underlying_asset,
+                expiration_date,
+                contract_type,
+                strike_price,
+                strike_price_gte or strike_price_gt,
+                strike_price_lte or strike_price_lt,
+                order,
+                sort,
+                limit,
+            )
+            if fallback_csv:
+                return fallback_csv
+        return json_to_csv(payload)
+    except httpx.HTTPStatusError as exc:
+        fallback_csv = _option_chain_fallback_csv(
+            underlying_asset,
+            expiration_date,
+            contract_type,
+            strike_price,
+            strike_price_gte or strike_price_gt,
+            strike_price_lte or strike_price_lt,
+            order,
+            sort,
+            limit,
+        )
+        if fallback_csv:
+            return fallback_csv
+        return f"Error: {exc}"
     except Exception as e:
         return f"Error: {e}"
 
@@ -458,7 +810,7 @@ async def get_snapshot_crypto_book(
             ticker=ticker, params=params, raw=True
         )
 
-        return json_to_csv(results.data.decode("utf-8"))
+        return _raw_to_csv(results)
     except Exception as e:
         return f"Error: {e}"
 
@@ -473,7 +825,7 @@ async def get_market_holidays(
     try:
         results = polygon_client.get_market_holidays(params=params, raw=True)
 
-        return json_to_csv(results.data.decode("utf-8"))
+        return _raw_to_csv(results)
     except Exception as e:
         return f"Error: {e}"
 
@@ -488,7 +840,7 @@ async def get_market_status(
     try:
         results = polygon_client.get_market_status(params=params, raw=True)
 
-        return json_to_csv(results.data.decode("utf-8"))
+        return _raw_to_csv(results)
     except Exception as e:
         return f"Error: {e}"
 
@@ -2004,3 +2356,4 @@ async def get_futures_snapshot(
 def run(transport: Literal["stdio", "sse", "streamable-http"] = "stdio") -> None:
     """Run the Massive MCP server."""
     poly_mcp.run(transport)
+

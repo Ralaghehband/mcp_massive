@@ -1,17 +1,19 @@
+from __future__ import annotations
+
 import json
 import csv
 import io
-from typing import Any
+from typing import Any, List, Mapping, Sequence
 
 
-def json_to_csv(json_input: str | dict) -> str:
+def json_to_csv(json_input: str | Mapping[str, Any] | Sequence[Any]) -> str:
     """
     Convert JSON to flattened CSV format.
 
     Args:
-        json_input: JSON string or dict. If the JSON has a 'results' key containing
-                   a list, it will be extracted. Otherwise, the entire structure
-                   will be wrapped in a list for processing.
+        json_input: JSON string, mapping, or sequence. If the JSON has a 'results'
+                   key containing a list, it will be extracted. Otherwise, the entire
+                   structure will be wrapped in a list for processing.
 
     Returns:
         CSV string with headers and flattened rows
@@ -22,14 +24,21 @@ def json_to_csv(json_input: str | dict) -> str:
     else:
         data = json_input
 
-    if isinstance(data, dict) and "results" in data:
+    if isinstance(data, Mapping) and "results" in data:
         records = data["results"]
-    elif isinstance(data, list):
+    elif isinstance(data, Sequence) and not isinstance(data, (str, bytes, bytearray)):
         records = data
     else:
         records = [data]
 
-    flattened_records = [_flatten_dict(record) for record in records]
+    mapping_records: List[Mapping[str, Any]] = []
+    for record in records:
+        if isinstance(record, Mapping):
+            mapping_records.append(record)
+        else:
+            mapping_records.append({"value": record})
+
+    flattened_records = [_flatten_dict(record) for record in mapping_records]
 
     if not flattened_records:
         return ""
@@ -52,7 +61,7 @@ def json_to_csv(json_input: str | dict) -> str:
 
 
 def _flatten_dict(
-    d: dict[str, Any], parent_key: str = "", sep: str = "_"
+    d: Mapping[str, Any], parent_key: str = "", sep: str = "_"
 ) -> dict[str, Any]:
     """
     Flatten a nested dictionary by joining keys with separator.
@@ -69,8 +78,8 @@ def _flatten_dict(
     for k, v in d.items():
         new_key = f"{parent_key}{sep}{k}" if parent_key else k
 
-        if isinstance(v, dict):
-            # Recursively flatten nested dicts
+        if isinstance(v, Mapping):
+            # Recursively flatten nested dicts / mappings
             items.extend(_flatten_dict(v, new_key, sep=sep).items())
         elif isinstance(v, list):
             # Convert lists to comma-separated strings

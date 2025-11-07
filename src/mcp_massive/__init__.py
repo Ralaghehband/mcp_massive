@@ -1,8 +1,18 @@
 import os
-from typing import Literal
-from .server import run
+from typing import Literal, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .server import run as _server_run
 
 __all__ = ["run", "main"]
+
+def run(transport: Literal["stdio", "sse", "streamable-http"] = "stdio") -> None:
+    """
+    Proxy to the server.run entry point while avoiding hard dependency on server at import time.
+    """
+    from .server import run as _server_run
+
+    _server_run(transport=transport)
 
 
 def main() -> None:
